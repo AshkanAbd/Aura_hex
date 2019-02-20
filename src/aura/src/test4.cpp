@@ -11,9 +11,11 @@
 
 void go_to_target(const char &c, Controller *controller);
 
-void do_mission(const int &TARGET);
+void do_mission(const int &TARGET, const cv::UMat &frame);
 
 bool compare(const std::vector<cv::Point> &p1, const std::vector<cv::Point> &p2);
+
+bool detect_blue_H(const cv::UMat &frame, cv::Rect &dst);
 
 double angle(const cv::Point &pt1, const cv::Point &pt2, const cv::Point &pt0);
 
@@ -22,21 +24,28 @@ void detect_black(const cv::UMat &frame, cv::UMat &dst);
 void detect_while(const cv::UMat &frame, cv::UMat &dst, std::vector<cv::Point> &dst_approx);
 
 cv::Scalar *black_low, *black_up, *white_low, *white_up;
+cv::Scalar *blue_low, *blue_up;
+
+Controller *controller;
 
 int main(int argc, char **argv) {
     // Mission Target
+    // -1 for return to start point
     int TARGET = 4;
 
     cv::ocl::setUseOpenCL(true);
     ros::init(argc, argv, "test_image");
     ros::NodeHandlePtr nh(new ros::NodeHandle);
 
-    Controller *controller = new Controller(nh);
+    controller = new Controller(nh);
     QRHandler *qr_handler;
     black_low = new cv::Scalar(0, 0, 0);
     black_up = new cv::Scalar(180, 255, 30);
     white_low = new cv::Scalar(0, 0, 50);
     white_up = new cv::Scalar(180, 100, 255);
+    blue_low = new cv::Scalar(110, 100, 130);
+    blue_up = new cv::Scalar(130, 255, 255);
+
 
     // 10 time in sec
     ros::Rate rate(10);
@@ -45,6 +54,11 @@ int main(int argc, char **argv) {
         // Wait for QR code in image
         std_msgs::StringConstPtr qr_code = ros::topic::waitForMessage<std_msgs::String>("/barcode", *nh,
                                                                                         ros::Duration(1, 0));
+        sensor_msgs::ImageConstPtr img_msg = ros::topic::waitForMessage<sensor_msgs::Image>("/bebop/image_raw", *nh,
+                                                                                            ros::Duration(2, 0));
+        cv_bridge::CvImageConstPtr img_ptr = cv_bridge::toCvCopy(img_msg, img_msg->encoding);
+        cv::UMat frame, frame_black, frame_white;
+        img_ptr->image.copyTo(frame);
         if (qr_code != nullptr) {
             // QR code detected
             qr_handler = new QRHandler(qr_code);
@@ -53,7 +67,7 @@ int main(int argc, char **argv) {
                 // Target found
                 char c = qr_handler->get_target(TARGET);
                 go_to_target(c, controller);
-                do_mission(TARGET);
+                do_mission(TARGET, frame);
             } else {
                 // Still search for target
                 char c = qr_handler->get_target(TARGET);
@@ -62,11 +76,6 @@ int main(int argc, char **argv) {
         }
         // No qr code found
         // search for qr
-        sensor_msgs::ImageConstPtr img_msg = ros::topic::waitForMessage<sensor_msgs::Image>("/bebop/image_raw", *nh,
-                                                                                            ros::Duration(2, 0));
-        cv_bridge::CvImageConstPtr img_ptr = cv_bridge::toCvCopy(img_msg, img_msg->encoding);
-        cv::UMat frame, frame_black, frame_white;
-        img_ptr->image.copyTo(frame);
         std::vector<cv::Point> approx;
         detect_black(frame, frame_black);
         detect_while(frame_black, frame_white, approx);
@@ -98,9 +107,14 @@ void go_to_target(const char &c, Controller *controller) {
     }
 }
 
-void do_mission(const int &TARGET) {
+void do_mission(const int &TARGET, const cv::UMat &frame) {
     if (TARGET == 4) {
-        
+        cv::Rect rect;
+        if (detect_blue_H(frame, rect)) {
+            // check for rect place then land
+            // todo need test
+            controller->land();
+        }
     }
 }
 
@@ -202,4 +216,26 @@ void detect_while(const cv::UMat &frame, cv::UMat &dst, std::vector<cv::Point> &
     frame.copyTo(dst);
     cv::drawContours(frame, std::vector<std::vector<cv::Point>>{dst_approx}, -1, cv::Scalar(255, 0, 0));
     cv::imshow("white detect", frame);
+}
+
+bool detect_blue_H(const cv::UMat &frame, cv::Rect &dst) {
+    cv::UMat hsv, mask, edge, filter;
+    cv::GaussianBlur(frame, filter, cv::Size(5, 5), -1);
+    cv::cvtColor(filter, hsv, cv::COLOR_BGR2HSV);
+    cv::inRange(hsv, *blue_low, *blue_up, mask);
+    cv::Canny(mask, edge, 100, 200);
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(edge, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
+    for (const auto &cnt : contours) {
+        auto epsilon = 0.001 * cv::arcLength(cnt, true);
+        std::vector<cv::Point> approx;
+        cv::approxPolyDP(cnt, approx, epsilon, true);
+        auto rect = cv::boundingRect(approx);
+        if (rect.area() < 1000) continue;
+        if (approx.size() > 10) {
+            dst = rect;
+            return true;
+        }
+    }
+    return false;
 }
